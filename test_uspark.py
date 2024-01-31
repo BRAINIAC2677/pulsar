@@ -21,7 +21,7 @@ import torchvision
 
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support, roc_auc_score
 
-dataset_path = './datasets/banglapark_finger_tapping/test_data'
+dataset_path = './datasets/uspark_finger_tapping/test_data'
 
 augmentations = ["original", "flip-vert", "flip-hor", "flip-hor-vert"]
 
@@ -45,47 +45,26 @@ print(patient_ids[:10])
 def dfs_from_ids(ids,get_augmented=True):
     dfs = []
     for i in ids:
-        file_name_df_lt = f"{dataset_path}/{i}_left_hand_original.csv"
-        file_name_df_lt_f0 = f"{dataset_path}/{i}_left_hand_flip-vert.csv"
-        file_name_df_lt_f1 = f"{dataset_path}/{i}_left_hand_flip-hor.csv"
-        file_name_df_lt_f2 = f"{dataset_path}/{i}_left_hand_flip-hor-vert.csv"
-        
-        file_name_df_rt = f"{dataset_path}/{i}_right_hand_original.csv"
-        file_name_df_rt_f0 = f"{dataset_path}/{i}_right_hand_flip-vert.csv"
-        file_name_df_rt_f1 = f"{dataset_path}/{i}_right_hand_flip-hor.csv"
-        file_name_df_rt_f2 = f"{dataset_path}/{i}_right_hand_flip-hor-vert.csv"
-
-        if not os.path.exists(file_name_df_lt):
+        file_name_df = f"{dataset_path}/{i}_original.csv"
+        file_name_df_f0 = f"{dataset_path}/{i}_flip-vert.csv"
+        file_name_df_f1 = f"{dataset_path}/{i}_flip-hor.csv"
+        file_name_df_f2 = f"{dataset_path}/{i}_flip-hor-vert.csv"
+        if not os.path.exists(file_name_df):
             continue
-        if not os.path.exists(file_name_df_lt_f0):
+        if not os.path.exists(file_name_df_f0):
             continue
-        if not os.path.exists(file_name_df_lt_f1):
+        if not os.path.exists(file_name_df_f1):
             continue
-        if not os.path.exists(file_name_df_lt_f2):
+        if not os.path.exists(file_name_df_f2):
             continue
-        if not os.path.exists(file_name_df_rt):
-            continue
-        if not os.path.exists(file_name_df_rt_f0):
-            continue
-        if not os.path.exists(file_name_df_rt_f1):
-            continue
-        if not os.path.exists(file_name_df_rt_f2):
-            continue
-            
-        df_lt = pd.read_csv(file_name_df_lt, index_col=0)
-        df_rt = pd.read_csv(file_name_df_rt, index_col=0)
+        df = pd.read_csv(file_name_df, index_col=0)
         if get_augmented:
-            df_lt_f0 = pd.read_csv(file_name_df_lt_f0, index_col=0)
-            df_lt_f1 = pd.read_csv(file_name_df_lt_f1, index_col=0)
-            df_lt_f2 = pd.read_csv(file_name_df_lt_f2, index_col=0)
-            
-            df_rt_f0 = pd.read_csv(file_name_df_rt_f0, index_col=0)
-            df_rt_f1 = pd.read_csv(file_name_df_rt_f1, index_col=0)
-            df_rt_f2 = pd.read_csv(file_name_df_rt_f2, index_col=0)
-            
-            dfs.extend([df_lt, df_lt_f0, df_lt_f1, df_lt_f2, df_rt, df_rt_f0, df_rt_f1, df_rt_f2])
+            df_f0 = pd.read_csv(file_name_df_f0, index_col=0)
+            df_f1 = pd.read_csv(file_name_df_f1, index_col=0)
+            df_f2 = pd.read_csv(file_name_df_f2, index_col=0)
+            dfs.extend([df, df_f0, df_f1, df_f2])
         else:
-            dfs.extend([df_lt, df_rt])
+            dfs.append(df)
     return dfs
 
 def get_test_data(test_ids):
@@ -240,5 +219,5 @@ if __name__ == "__main__":
 
     # Create a DataFrame for the results
     df_results = pd.DataFrame(results, columns=['Model', 'Acc', 'Prec', 'Rec', 'F1 (macro)', 'F1 (weighted)', 'AUC'])
-    df_results.to_csv('banglapark_test_set_scores.csv', index=False)
+    df_results.to_csv('uspark_test_set_scores.csv', index=False)
     print(df_results)
