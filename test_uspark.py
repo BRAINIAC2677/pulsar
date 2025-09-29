@@ -72,13 +72,18 @@ def get_test_data(test_ids):
     df_test = pd.concat(test_dfs)
     return df_test
 
-is_cuda = torch.cuda.is_available()
-
-if is_cuda:
+# Device detection: CUDA > MPS > CPU
+if torch.cuda.is_available():
     device = torch.device("cuda")
+    print("Using CUDA (NVIDIA GPU)")
+elif torch.backends.mps.is_available():
+    device = torch.device("mps")
+    print("Using MPS (Apple Silicon GPU)")
 else:
     device = torch.device("cpu")
-print(device)
+    print("Using CPU")
+
+print(f"Device: {device}")
 
 def eval_func(model, criterion, data_loader):
     model.eval()
@@ -89,8 +94,8 @@ def eval_func(model, criterion, data_loader):
     iters = len(data_loader)
     with torch.no_grad():
         for i, (inputs, labels) in enumerate(data_loader):
-            labels = labels.cuda().long()
-            inputs = inputs.cuda().float()
+            labels = labels.to(device).long()
+            inputs = inputs.to(device, dtype=torch.float32)
 
             last_label = labels[:, -1, :]
             last_label = torch.argmax(last_label, 1)
@@ -110,30 +115,93 @@ def eval_func(model, criterion, data_loader):
     return loss_total, np.argmax(preds, axis=2).flatten(),  np.array(groundtruth).flatten()
 
 
+def eval_ensemble_func(models, criterion, data_loader):
+    for model in models:
+        model.eval()
+    preds = []
+    groundtruth = []
+    t0 = time.time()
+    loss_total = 0
+    iters = len(data_loader)
+    with torch.no_grad():
+        for i, (inputs, labels) in enumerate(data_loader):
+            labels = labels.to(device).long()
+            inputs = inputs.to(device, dtype=torch.float32)
+
+            last_label = labels[:, -1, :]
+            last_label = torch.argmax(last_label, 1)
+
+            # Get predictions from all models and average them
+            ensemble_outputs = []
+            for model in models:
+                last_out = model(inputs)
+                ensemble_outputs.append(last_out)
+            
+            # Average the ensemble outputs
+            ensemble_output = torch.stack(ensemble_outputs).mean(dim=0)
+            
+            loss = criterion(ensemble_output, last_label)
+
+            preds.append(ensemble_output.cpu().detach().numpy())
+            groundtruth.append(last_label.cpu().detach().numpy())
+            loss_total += loss
+
+            if i%CFG.print_freq == 1 or i == iters-1:
+                t1 = time.time()
+                print(f"Iteration: {i}/{iters} | Test-Loss: {loss_total/i} | ETA: {((t1-t0)/i * iters) - (t1-t0)}s")
+
+    return loss_total, np.argmax(preds, axis=2).flatten(),  np.array(groundtruth).flatten()
+
+
 def generate_test_scores(_number_of_runs:int=1, _model_name:str='JS_AC_PU'):
     print(f'\n============ current spec ===========')
     print(f'Number of Runs: {_number_of_runs}')
     print(f'Model Variant: {_model_name}')
     
-
-
-    if CFG.model_type == "AAGCN":
-        # graph = adj_mat.Graph(adj_mat.num_node, adj_mat.self_link, adj_mat.inward, adj_mat.outward, adj_mat.neighbor)
-        graph = adj_mat.Graph()
-        adaptive=False
-        if len(_model_name.split('_')) > 1 and _model_name.split('_')[1] == 'AC':
-            adaptive=True
-        print(f'adaptive: {adaptive}\n')
+    if _model_name == 'PULSAR':
+        # Load all 4 ensemble models
+        ensemble_models = []
+        ensemble_model_names = ['AS_AC_PU', 'BS_AC_PU', 'JS_AC_PU', 'VS_AC_PU']
         
-        model = aagcn_small.Model(adaptive=adaptive, num_class=CFG.num_classes, num_point=21, num_person=1, graph=graph, drop_out=0.5, in_channels=CFG.num_feats)
-        # Load the saved model checkpoint
-        checkpoint = torch.load(f'./pretrained_models/{_model_name}/model.pth')
-        # Extract the state dictionary for the model
-        model_state_dict = checkpoint['model_state_dict']
-        # Load the state dictionary into your model
-        model.load_state_dict(model_state_dict)
+        for model_name in ensemble_model_names:
+            if CFG.model_type == "AAGCN":
+                graph = adj_mat.Graph()
+                adaptive = True  # All ensemble models are AC (adaptive)
+                print(f'Loading {model_name} - adaptive: {adaptive}')
+                
+                model = aagcn_small.Model(adaptive=adaptive, num_class=CFG.num_classes, num_point=21, num_person=1, graph=graph, drop_out=0.5, in_channels=CFG.num_feats)
+                # Load the saved model checkpoint
+                checkpoint = torch.load(f'./pretrained_models/{model_name}/model.pth', map_location=device)
+                # Extract the state dictionary for the model
+                model_state_dict = checkpoint['model_state_dict']
+                # Load the state dictionary into your model
+                model.load_state_dict(model_state_dict)
+                model.to(device)
+                ensemble_models.append(model)
+        
+        models = ensemble_models
+        is_ensemble = True
+    else:
+        # Single model case (existing logic)
+        if CFG.model_type == "AAGCN":
+            # graph = adj_mat.Graph(adj_mat.num_node, adj_mat.self_link, adj_mat.inward, adj_mat.outward, adj_mat.neighbor)
+            graph = adj_mat.Graph()
+            adaptive=False
+            if len(_model_name.split('_')) > 1 and _model_name.split('_')[1] == 'AC':
+                adaptive=True
+            print(f'adaptive: {adaptive}\n')
+            
+            model = aagcn_small.Model(adaptive=adaptive, num_class=CFG.num_classes, num_point=21, num_person=1, graph=graph, drop_out=0.5, in_channels=CFG.num_feats)
+            # Load the saved model checkpoint
+            checkpoint = torch.load(f'./pretrained_models/{_model_name}/model.pth', map_location=device)
+            # Extract the state dictionary for the model
+            model_state_dict = checkpoint['model_state_dict']
+            # Load the state dictionary into your model
+            model.load_state_dict(model_state_dict)
 
-    model.cuda()
+        model.to(device)
+        models = model
+        is_ensemble = False
 
     if CFG.loss_fn == "BCE":
         criterion = nn.CrossEntropyLoss()
@@ -143,9 +211,17 @@ def generate_test_scores(_number_of_runs:int=1, _model_name:str='JS_AC_PU'):
 
     if CFG.sam:
         optimizer_base = torch.optim.Adam
-        optimizer = SAM.SAM(model.parameters(), optimizer_base,  lr=CFG.lr, rho=0.5, adaptive=True)
+        if is_ensemble:
+            # For ensemble, we don't need optimizer during testing
+            optimizer = None
+        else:
+            optimizer = SAM.SAM(model.parameters(), optimizer_base,  lr=CFG.lr, rho=0.5, adaptive=True)
     else:
-        optimizer = torch.optim.Adam(model.parameters(), lr=CFG.lr)
+        if is_ensemble:
+            # For ensemble, we don't need optimizer during testing
+            optimizer = None
+        else:
+            optimizer = torch.optim.Adam(model.parameters(), lr=CFG.lr)
         
     np.random.seed(24)
     classification_reports = []
@@ -155,24 +231,28 @@ def generate_test_scores(_number_of_runs:int=1, _model_name:str='JS_AC_PU'):
     for current_run in range(_number_of_runs):
         print(f'current_run: {current_run}')
         np.random.shuffle(patient_ids)
-        test_ids = patient_ids[:120]
+        test_ids = patient_ids[:20]
+        # test_ids = patient_ids
         df_test = get_test_data(test_ids)
-#         print("[INFO] TEST DATA DISTRIBUTION")
-#         print(df_test["LABEL"].value_counts())
+        print("[INFO] TEST DATA DISTRIBUTION")
+        print(df_test["LABEL"].value_counts())
 
         test_numpy = df_to_numpy(df_test)
         test_set = HandPoseDatasetNumpy(test_numpy)
         test_loader = DataLoader(test_set, batch_size=CFG.batch_size, drop_last=True, pin_memory=True)
-#         print(f"[INFO] TEST ON {len(test_set)} DATAPOINTS")
+        print(f"[INFO] TEST ON {len(test_set)} DATAPOINTS")
             
-
-        test_loss, preds_test, gt_test = eval_func(model,criterion, test_loader)
+        # Use appropriate evaluation function based on whether it's ensemble or single model
+        if is_ensemble:
+            test_loss, preds_test, gt_test = eval_ensemble_func(models, criterion, test_loader)
+        else:
+            test_loss, preds_test, gt_test = eval_func(models, criterion, test_loader)
 
         f1_test_micro = f1_score(gt_test, preds_test, average="micro")
         f1_test_macro = f1_score(gt_test, preds_test, average="macro")
-#         print(f"[TEST] Test F1-Score Micro {f1_test_micro}")
-#         print(f"[TEST] Test F1-Score Macro {f1_test_macro}")
-#         print("[TEST] Classification Report")
+        print(f"[TEST] Test F1-Score Micro {f1_test_micro:.4f}")
+        print(f"[TEST] Test F1-Score Macro {f1_test_macro:.4f}")
+        print("[TEST] Classification Report")
 
         report = classification_report(gt_test, preds_test, target_names=CFG.classes, digits=3, output_dict=True)
         classification_reports.append(classification_report(gt_test, preds_test, target_names=CFG.classes, digits=3))
@@ -209,15 +289,35 @@ def generate_test_scores(_number_of_runs:int=1, _model_name:str='JS_AC_PU'):
     return avg_metrics
 
 if __name__ == "__main__":
-    models = ['JS', 'JS_PU', 'JS_AC', 'JS_AC_PU']
+    # Start timing the script execution
+    script_start_time = time.time()
+    print(f"[INFO] Script execution started at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(script_start_time))}")
+    
+    models = ['JS', 'JS_PU', 'JS_AC', 'JS_AC_PU', 'AS_AC_PU', 'BS_AC_PU', 'VS_AC_PU', 'PULSAR']
     results = []
     number_of_runs=20
 
     for model in models:
+        model_start_time = time.time()
+        print(f"\n[INFO] Starting evaluation for model: {model}")
+        
         avg_metrics = generate_test_scores(number_of_runs, model)
         results.append([model] + list(avg_metrics.values()))
+        
+        model_end_time = time.time()
+        model_duration = model_end_time - model_start_time
+        print(f"[INFO] Model {model} completed in: {model_duration:.2f} seconds ({model_duration/60:.2f} minutes)")
 
     # Create a DataFrame for the results
     df_results = pd.DataFrame(results, columns=['Model', 'Acc', 'Prec', 'Rec', 'F1 (macro)', 'F1 (weighted)', 'AUC'])
     df_results.to_csv('uspark_test_set_scores.csv', index=False)
     print(df_results)
+    
+    # End timing and print total execution time
+    script_end_time = time.time()
+    total_duration = script_end_time - script_start_time
+    print(f"\n{'='*60}")
+    print(f"[INFO] Script execution completed at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(script_end_time))}")
+    print(f"[INFO] Total execution time: {total_duration:.2f} seconds ({total_duration/60:.2f} minutes)")
+    print(f"[INFO] Average time per model: {total_duration/len(models):.2f} seconds")
+    print(f"{'='*60}")
