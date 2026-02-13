@@ -4,7 +4,7 @@
 ## Overview
 
 
-![Alt Text](/assets/PULSAR_full_overview.png)
+![Alt Text](/assets/PULSAR_full_overview.jpg)
 
 
 Timely diagnosis of movement disorders like Parkinson’s disease (PD) improves quality of life. However, access to clinical diagnosis is limited in low-income countries. Here, we present PULSAR, a novel method for classifying individuals with or without PD from webcam-recorded videos of the finger-tapping task used in the Movement Disorder Society - Unified Parkinson's Disease Rating Scale (MDS-UPDRS). PULSAR was trained and evaluated on data from 382 participants, including 183 self-reported PD patients. We used an adaptive graph convolutional neural network to dynamically learn task-specific spatio-temporal edges and enhanced it with a multi-stream convolution model to capture critical features like finger joint locations, tapping velocity, and acceleration of tapping. As video labels are self-reported, some non-PD labels may be undiagnosed cases. To address this, we used Positive Unlabeled (PU) Learning, which outperformed traditional supervised learning. PULSAR achieved 80.95% accuracy on the validation set and 71.29% mean accuracy (2.49% standard deviation) on an independent test set. We hope PULSAR can aid in accessible PD screening and that these techniques may extend to assessing disorders like ataxia and Huntington’s disease.
