@@ -30,28 +30,44 @@ def df_to_numpy(df):
   train_data_numpy = (x, y_ohe)
   return train_data_numpy
 
-class HandPoseDatasetNumpy(Dataset):
-    def __init__(self, data, bone_stream=CFG.bone_stream, vel_stream=CFG.vel_stream, acc_stream=CFG.acc_stream):
-        self.data = data
+
+class HandPoseDatasetMapped(Dataset):
+    def __init__(self, data_list, joint_stream=CFG.joint_stream,bone_stream=CFG.bone_stream, vel_stream=CFG.vel_stream, acc_stream=CFG.acc_stream):
+        self.data_list = data_list # List of tuples: [(x1, y1), (x2, y2), ...]
+        self.joint_stream=joint_stream
         self.bone_stream = bone_stream
         self.vel_stream = vel_stream
         self.acc_stream = acc_stream
-    
-    def __len__(self):
-        return len(self.data[0])
-    
-    def __getitem__(self, idx):
-        x = self.data[0]
-        y = self.data[1]
-        seq_x = x[idx:idx+CFG.sequence_length]
-        seq_y = y[idx:idx+CFG.sequence_length]
-
-        #padding
-        to_pad = CFG.sequence_length - seq_x.shape[0]
-        x_pad = np.pad(seq_x, ((0, to_pad), (0, 0)), mode='mean')
-        y_pad = np.pad(seq_y, ((0, to_pad), (0, 0)), mode='mean')
+        self.index_map = [] 
         
-        x = x_pad.reshape(CFG.sequence_length, 21, 3)
+        # Build the Index Map
+        for patient_idx, (x_data, _) in enumerate(self.data_list):
+            num_frames = len(x_data)
+            # Calculate how many valid sequences this patient has
+            num_sequences = num_frames - CFG.sequence_length + 1
+            
+            if num_sequences > 0:
+                for start_frame in range(num_sequences):
+                    # Store the address: (Which Patient?, Which Frame?)
+                    self.index_map.append((patient_idx, start_frame))
+
+    def __len__(self):
+        return len(self.index_map)
+
+    def __getitem__(self, idx):
+        # 1. Look up where the data lives
+        patient_idx, start_frame = self.index_map[idx]
+        
+        # 2. Retrieve the specific patient's data
+        full_x, full_y = self.data_list[patient_idx]
+        
+        # 3. Slice safely
+        end_frame = start_frame + CFG.sequence_length
+        seq_x = full_x[start_frame : end_frame]
+        seq_y = full_y[start_frame : end_frame]
+
+        # Reshape and feature engineering...
+        x = seq_x.reshape(CFG.sequence_length, 21, 3)
         
         if CFG.add_feats:
             #additional features: https://link.springer.com/content/pdf/10.1186/s13640-019-0476-x.pdf
@@ -93,76 +109,7 @@ class HandPoseDatasetNumpy(Dataset):
             phi = np.arctan(x[:, :, 1]/x[:, :, 0])
             x = np.concatenate((x, phi),axis=2)
 
-        return x, y_pad
-
-
-class HandImageDataset(Dataset):
-    def __init__(self, df, root_dir,  seq_len=16, transforms=False):
-        self.data_frames = df
-        self.labels = self.data_frames["label"]
-        self.img_paths = self.data_frames["file"]
-        self.classes = ["Grasp",   "Move",    "Negative",    "Position",    "Reach",   "Release"]
-        if CFG.no_release:
-            self.classes = ["Grasp",   "Move",    "Negative",    "Position",    "Reach"]
-        self.lb = sklearn.preprocessing.LabelBinarizer().fit(self.classes)
-        self.seq_len = seq_len
-        self.root_dir = root_dir
-        self.transforms = transforms
-
-        self.rand_rot_range = (-15,15)
-        self.resize = (568,568)
-        self.rand_crop_size = (512,512)
-    
-    def set_transform_params(self):
-        self.rrc = transforms.RandomResizedCrop(self.rand_crop_size, scale=(0.8, 1.0), ratio=(3. / 4., 4. / 3.))
-        print(self.rrc)
-        self.crop_indices = self.rrc.get_params(torch.rand(3,*self.rand_crop_size), self.rrc.scale, self.rrc.ratio)
-
-        self.rot_angle = np.random.randint(*self.rand_rot_range)
-        self.p_hflip = random.random()
-        self.p_vflip = random.random()
-
-    def do_transform(self, image):
-        resize = transforms.Resize(size=self.resize)
-        image = resize(image)
-        #center_crop = transforms.CenterCrop(size=(850,850))
-        #image = center_crop(image)
         
-        i, j, h, w = self.crop_indices
-        image = transforms.functional.resized_crop(image, i, j, h, w, self.rrc.size)
+        # [Insert Stream Logic Here]
 
-        image = transforms.functional.rotate(image, self.rot_angle)
-
-        if self.p_hflip > 0.5:
-            image = transforms.functional.hflip(image)
-        if self.p_vflip > 0.5:
-            image = transforms.functional.vflip(image)
-
-        image = transforms.functional.to_tensor(image)
-        return image
-    
-    def __len__(self):
-        return len(self.data_frames)
-    
-    def __getitem__(self, idx):
-        start = idx
-        if start > len(self.data_frames) - self.seq_len:
-            start = len(self.data_frames) - self.seq_len
-        end = start + self.seq_len    
-        indices = list(range(start, end))
-        images = []
-        labels = []
-        self.set_transform_params()
-
-        for i in indices:
-            image_path = self.root_dir + self.img_paths[i]
-            image = Image.open(image_path)
-            if self.transforms:
-                image = self.do_transform(image)
-
-            images.append(image)
-
-        y = torch.tensor(self.lb.transform(self.labels[start:end]), dtype=torch.long)
-        img_seq = torch.stack(images)
-
-        return img_seq, y
+        return x, seq_y

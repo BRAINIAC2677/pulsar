@@ -7,14 +7,17 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, random_split
+from scipy import stats
+from ast import literal_eval as make_tuple
 
 import sklearn
 from sklearn.metrics import f1_score, accuracy_score
 from sklearn.metrics import classification_report
 from sklearn.utils import class_weight
+from sklearn import preprocessing
 
 from model import aagcn_small, loss
-from data_preprocessing.handpose_dataset import HandPoseDatasetNumpy, df_to_numpy
+from data_preprocessing.handpose_dataset import HandPoseDatasetMapped
 from config import CFG
 from utils import adj_mat
 import torchvision
@@ -25,7 +28,19 @@ dataset_path = './datasets/uspark_finger_tapping/test_data'
 
 augmentations = ["original", "flip-vert", "flip-hor", "flip-hor-vert"]
 
-## get all files
+def df_to_numpy(df):
+    x_elems = df.drop("LABEL", axis=1).values
+    x = [make_tuple(elem) for elem in x_elems for elem in elem]
+    x = np.array(x)
+    x = x.reshape(len(x_elems), 3*21)
+    lb = preprocessing.LabelBinarizer().fit( CFG.classes)
+    y = np.array(df["LABEL"]).reshape(-1,1)
+    y_ohe = lb.transform(y)
+    y_ohe = np.hstack((y_ohe,1-y_ohe)) 
+    train_data_numpy = (x, y_ohe)
+    return train_data_numpy
+
+# get all files
 all_csv = os.listdir(dataset_path)
 print(f'number of csv files: {len(all_csv)}')
 
@@ -39,6 +54,7 @@ for i in patient_ids_all:
     if i not in patient_ids:
         patient_ids.append(i)
 
+patient_ids=sorted(patient_ids)
 print(f'number of unique patient: {len(patient_ids)}')
 print(patient_ids[:10])
 
@@ -69,8 +85,11 @@ def dfs_from_ids(ids,get_augmented=True):
 
 def get_test_data(test_ids):
     test_dfs = dfs_from_ids(test_ids)
-    df_test = pd.concat(test_dfs)
+    df_test = pd.concat(test_dfs,ignore_index=True)
     return df_test
+
+def get_test_data_list_numpy(test_ids):
+    return [df_to_numpy(df) for df in dfs_from_ids(test_ids) if df.shape[0]>0]
 
 # Device detection: CUDA > MPS > CPU
 if torch.cuda.is_available():
@@ -85,234 +104,107 @@ else:
 
 print(f"Device: {device}")
 
-def eval_func(model, criterion, data_loader):
-    model.eval()
-    preds = []
-    groundtruth = []
-    t0 = time.time()
-    loss_total = 0
-    iters = len(data_loader)
-    with torch.no_grad():
-        for i, (inputs, labels) in enumerate(data_loader):
-            labels = labels.to(device).long()
-            inputs = inputs.to(device, dtype=torch.float32)
-
-            last_label = labels[:, -1, :]
-            last_label = torch.argmax(last_label, 1)
-
-            last_out = model(inputs)
-            
-            loss = criterion(last_out, last_label)
-
-            preds.append(last_out.cpu().detach().numpy())
-            groundtruth.append(last_label.cpu().detach().numpy())
-            loss_total += loss
-
-            if i%CFG.print_freq == 1 or i == iters-1:
-                t1 = time.time()
-                print(f"Iteration: {i}/{iters} | Test-Loss: {loss_total/i} | ETA: {((t1-t0)/i * iters) - (t1-t0)}s")
-
-    return loss_total, np.argmax(preds, axis=2).flatten(),  np.array(groundtruth).flatten()
+def calculate_mean_and_ci(data, confidence=0.95):
+    """Calculates mean and 95% CI using a t-distribution."""
+    n = len(data)
+    mean = np.mean(data)
+    sem = stats.sem(data)
+    margin_of_error = sem * stats.t.ppf((1 + confidence) / 2., n - 1) if n-1>0 else 0
+    return f"{mean:.2f} \u00B1 {margin_of_error:.2f}"
 
 
-def eval_ensemble_func(models, criterion, data_loader):
-    for model in models:
-        model.eval()
-    preds = []
-    groundtruth = []
-    t0 = time.time()
-    loss_total = 0
-    iters = len(data_loader)
-    with torch.no_grad():
-        for i, (inputs, labels) in enumerate(data_loader):
-            labels = labels.to(device).long()
-            inputs = inputs.to(device, dtype=torch.float32)
-
-            last_label = labels[:, -1, :]
-            last_label = torch.argmax(last_label, 1)
-
-            # Get predictions from all models and average them
-            ensemble_outputs = []
-            for model in models:
-                last_out = model(inputs)
-                ensemble_outputs.append(last_out)
-            
-            # Average the ensemble outputs
-            ensemble_output = torch.stack(ensemble_outputs).mean(dim=0)
-            
-            loss = criterion(ensemble_output, last_label)
-
-            preds.append(ensemble_output.cpu().detach().numpy())
-            groundtruth.append(last_label.cpu().detach().numpy())
-            loss_total += loss
-
-            if i%CFG.print_freq == 1 or i == iters-1:
-                t1 = time.time()
-                print(f"Iteration: {i}/{iters} | Test-Loss: {loss_total/i} | ETA: {((t1-t0)/i * iters) - (t1-t0)}s")
-
-    return loss_total, np.argmax(preds, axis=2).flatten(),  np.array(groundtruth).flatten()
-
-
-def generate_test_scores(_number_of_runs:int=1, _model_name:str='JS_AC_PU'):
-    print(f'\n============ current spec ===========')
-    print(f'Number of Runs: {_number_of_runs}')
-    print(f'Model Variant: {_model_name}')
-    
-    if _model_name == 'PULSAR':
-        # Load all 4 ensemble models
-        ensemble_models = []
-        ensemble_model_names = ['AS_AC_PU', 'BS_AC_PU', 'JS_AC_PU', 'VS_AC_PU']
-        
-        for model_name in ensemble_model_names:
-            if CFG.model_type == "AAGCN":
-                graph = adj_mat.Graph()
-                adaptive = True  # All ensemble models are AC (adaptive)
-                print(f'Loading {model_name} - adaptive: {adaptive}')
-                
-                model = aagcn_small.Model(adaptive=adaptive, num_class=CFG.num_classes, num_point=21, num_person=1, graph=graph, drop_out=0.5, in_channels=CFG.num_feats)
-                # Load the saved model checkpoint
-                checkpoint = torch.load(f'./pretrained_models/{model_name}/model.pth', map_location=device)
-                # Extract the state dictionary for the model
-                model_state_dict = checkpoint['model_state_dict']
-                # Load the state dictionary into your model
-                model.load_state_dict(model_state_dict)
-                model.to(device)
-                ensemble_models.append(model)
-        
-        models = ensemble_models
-        is_ensemble = True
-    else:
-        # Single model case (existing logic)
-        if CFG.model_type == "AAGCN":
-            # graph = adj_mat.Graph(adj_mat.num_node, adj_mat.self_link, adj_mat.inward, adj_mat.outward, adj_mat.neighbor)
-            graph = adj_mat.Graph()
-            adaptive=False
-            if len(_model_name.split('_')) > 1 and _model_name.split('_')[1] == 'AC':
-                adaptive=True
-            print(f'adaptive: {adaptive}\n')
-            
-            model = aagcn_small.Model(adaptive=adaptive, num_class=CFG.num_classes, num_point=21, num_person=1, graph=graph, drop_out=0.5, in_channels=CFG.num_feats)
-            # Load the saved model checkpoint
-            checkpoint = torch.load(f'./pretrained_models/{_model_name}/model.pth', map_location=device)
-            # Extract the state dictionary for the model
-            model_state_dict = checkpoint['model_state_dict']
-            # Load the state dictionary into your model
-            model.load_state_dict(model_state_dict)
-
-        model.to(device)
-        models = model
-        is_ensemble = False
-
-    if CFG.loss_fn == "BCE":
-        criterion = nn.CrossEntropyLoss()
-        
-    if CFG.loss_fn == "Focal":
-        criterion = loss.FocalLoss()
-
-    if CFG.sam:
-        optimizer_base = torch.optim.Adam
-        if is_ensemble:
-            # For ensemble, we don't need optimizer during testing
-            optimizer = None
-        else:
-            optimizer = SAM.SAM(model.parameters(), optimizer_base,  lr=CFG.lr, rho=0.5, adaptive=True)
-    else:
-        if is_ensemble:
-            # For ensemble, we don't need optimizer during testing
-            optimizer = None
-        else:
-            optimizer = torch.optim.Adam(model.parameters(), lr=CFG.lr)
-        
-    np.random.seed(24)
-    classification_reports = []
-    cumulative_metrics = {'accuracy': 0, 'precision': 0, 'recall': 0, 'f1_macro': 0, 'f1_weighted': 0, 'auroc': 0}
-
-
-    for current_run in range(_number_of_runs):
-        print(f'current_run: {current_run}')
-        np.random.shuffle(patient_ids)
-        test_ids = patient_ids[:20]
-        # test_ids = patient_ids
-        df_test = get_test_data(test_ids)
-        print("[INFO] TEST DATA DISTRIBUTION")
-        print(df_test["LABEL"].value_counts())
-
-        test_numpy = df_to_numpy(df_test)
-        test_set = HandPoseDatasetNumpy(test_numpy)
-        test_loader = DataLoader(test_set, batch_size=CFG.batch_size, drop_last=True, pin_memory=True)
-        print(f"[INFO] TEST ON {len(test_set)} DATAPOINTS")
-            
-        # Use appropriate evaluation function based on whether it's ensemble or single model
-        if is_ensemble:
-            test_loss, preds_test, gt_test = eval_ensemble_func(models, criterion, test_loader)
-        else:
-            test_loss, preds_test, gt_test = eval_func(models, criterion, test_loader)
-
-        f1_test_micro = f1_score(gt_test, preds_test, average="micro")
-        f1_test_macro = f1_score(gt_test, preds_test, average="macro")
-        print(f"[TEST] Test F1-Score Micro {f1_test_micro:.4f}")
-        print(f"[TEST] Test F1-Score Macro {f1_test_macro:.4f}")
-        print("[TEST] Classification Report")
-
-        report = classification_report(gt_test, preds_test, target_names=CFG.classes, digits=3, output_dict=True)
-        classification_reports.append(classification_report(gt_test, preds_test, target_names=CFG.classes, digits=3))
-
-        # Calculate and store metrics
-        accuracy = accuracy_score(gt_test, preds_test)
-        precision, recall, f1_macro, _ = precision_recall_fscore_support(gt_test, preds_test, average='macro')
-        _, _, f1_weighted, _ = precision_recall_fscore_support(gt_test, preds_test, average='weighted')
-        auroc = roc_auc_score(gt_test, preds_test)
-
-        cumulative_metrics['accuracy'] += accuracy
-        cumulative_metrics['precision'] += precision
-        cumulative_metrics['recall'] += recall
-        cumulative_metrics['f1_macro'] += f1_macro
-        cumulative_metrics['f1_weighted'] += f1_weighted
-        cumulative_metrics['auroc'] += auroc
-        
-    # Print all classification reports
-    print(f'\n============ current spec ===========')
-    print(f'Number of Runs: {_number_of_runs}')
-    print(f'Model Variant: {_model_name}\n')
-    print("\n=========== all reports ===============\n")
-    for run, report in enumerate(classification_reports):
-        print(f'\nreport for run: {run}')
-        print(report)
-
-    # Calculate average metrics
-    print(f'\n=============== average report ==================\n')
-    avg_metrics = {metric: cumulative_metrics[metric] / _number_of_runs for metric in cumulative_metrics}
-    for metric in cumulative_metrics:
-        print(f'{metric}: {avg_metrics[metric]}')
-
-    # Return the average metrics
-    return avg_metrics
-
-if __name__ == "__main__":
+def evaluate_model(models_name:list[str],number_of_runs=20,patients_per_sample=120,seed=24,fast_forward=0):
     # Start timing the script execution
     script_start_time = time.time()
     print(f"[INFO] Script execution started at: {time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(script_start_time))}")
     
-    models = ['JS', 'JS_PU', 'JS_AC', 'JS_AC_PU', 'AS_AC_PU', 'BS_AC_PU', 'VS_AC_PU', 'PULSAR']
-    results = []
-    number_of_runs=20
-
-    for model in models:
-        model_start_time = time.time()
-        print(f"\n[INFO] Starting evaluation for model: {model}")
-        
-        avg_metrics = generate_test_scores(number_of_runs, model)
-        results.append([model] + list(avg_metrics.values()))
-        
-        model_end_time = time.time()
-        model_duration = model_end_time - model_start_time
-        print(f"[INFO] Model {model} completed in: {model_duration:.2f} seconds ({model_duration/60:.2f} minutes)")
-
+    models = [x for item in models_name for x in ([item] if item!='PULSAR' else ['JS_AC_PU', 'BS_AC_PU', 'VS_AC_PU' , 'AS_AC_PU'])]
+    models=list(set(models))
+    print(models)
+    # rng_legacy_engine = np.random.RandomState(24)
+    rng = np.random.default_rng(seed=seed)
+    # rng.bit_generator.advance(fast_forward)
+    for _ in range(fast_forward):
+        rng.choice(patient_ids,patients_per_sample,replace=True)
+    # np.random.seed(24)
+    graph = adj_mat.Graph()
+    results=[]
+    for _ in range(number_of_runs):
+        # first inference
+        inference_output={}
+        run_specific_results=[]
+        sampled_ids=rng.choice(patient_ids,patients_per_sample,replace=True)
+        # df_test = get_test_data(sampled_ids)
+        # test_numpy = df_to_numpy(df_test)
+        test_numpy_list=get_test_data_list_numpy(sampled_ids)
+        print(f"starting execution for {_} runs")
+        for model_name in models:
+            model_start_time = time.time()
+            print(f"\n[INFO] Starting evaluation for model: {model_name}")
+            adaptive=len(model_name.split('_')) > 1 and model_name.split('_')[1] == 'AC'        
+            model = aagcn_small.Model(adaptive=adaptive, num_class=CFG.num_classes, num_point=21, num_person=1, graph=graph, drop_out=0.5, in_channels=CFG.num_feats)
+            checkpoint = torch.load(f'./pretrained_models/{model_name}/model.pth', map_location=device,weights_only=False)
+            model_state_dict = checkpoint['model_state_dict']
+            model.load_state_dict(model_state_dict)
+            model.to(device)
+            criterion = loss.FocalLoss() if CFG.loss_fn == "Focal" else nn.CrossEntropyLoss()
+            # cumulative_metrics = {'accuracy': 0, 'precision': 0, 'recall': 0, 'f1_macro': 0, 'f1_weighted': 0, 'auroc': 0}
+            # test_set = HandPoseDatasetNumpy(test_numpy,joint_stream=model_name.startswith('JS'),bone_stream=model_name.startswith('BS'),vel_stream=model_name.startswith('VS'),acc_stream=model_name.startswith('AS'))
+            test_set = HandPoseDatasetMapped(test_numpy_list,joint_stream=model_name.startswith('JS'),bone_stream=model_name.startswith('BS'),vel_stream=model_name.startswith('VS'),acc_stream=model_name.startswith('AS'))
+            test_loader = DataLoader(test_set, batch_size=CFG.batch_size, drop_last=True, pin_memory=True)
+            print(len(sampled_ids),len(test_loader))
+            model.eval()
+            preds = []
+            groundtruth = []
+            t0 = time.time()
+            loss_total = 0
+            iters = len(test_loader)
+            with torch.no_grad():
+                for i, (inputs, labels) in enumerate(test_loader):
+                    labels = labels.to(device).long()
+                    inputs = inputs.to(device, dtype=torch.float32)
+                    last_label = labels[:, -1, :]
+                    last_label = torch.argmax(last_label,dim=1)
+                    last_out = model(inputs)
+                    cur_loss = criterion(last_out, last_label)
+                    preds.append(last_out.cpu().detach().numpy())
+                    groundtruth.append(last_label.cpu().detach().numpy())
+                    loss_total += cur_loss
+                    if i%CFG.print_freq == 1 or i == iters-1:
+                        t1 = time.time()
+                        print(f"Iteration: {i}/{iters} | Test-Loss: {loss_total/i} | ETA: {((t1-t0)/i * iters) - (t1-t0)}s")
+                    # break 
+            gt_test=np.array(groundtruth).flatten()
+            preds_test_prob=np.asarray(preds).reshape(-1,preds[0].shape[-1])
+            inference_output["groundtruth"]=gt_test
+            inference_output[model_name]=preds_test_prob 
+            model_end_time = time.time()
+            model_duration = model_end_time - model_start_time
+            print(f"[INFO] Model {model_name} completed in: {model_duration:.2f} seconds ({model_duration/60:.2f} minutes)")
+        # result generation
+        for model_name in models_name:
+            models_required=[model_name] if model_name !="PULSAR" else ['JS_AC_PU', 'BS_AC_PU', 'VS_AC_PU' , 'AS_AC_PU']
+            weights={'JS_AC_PU':0.2, 'BS_AC_PU':0.4, 'VS_AC_PU':0.1 , 'AS_AC_PU':0.3}if model_name=='PULSAR' else {model_name:1.0}
+            preds_test=np.zeros(1,dtype=float)
+            gt_test=inference_output["groundtruth"] 
+            for model_required in models_required:
+                preds_test = preds_test + weights[model_required]*inference_output[model_required]
+            preds_test = np.argmax(preds_test, axis=1).flatten()
+            accuracy = accuracy_score(gt_test, preds_test)
+            precision, recall, f1_macro, _ = precision_recall_fscore_support(gt_test, preds_test, average='macro',zero_division=0)
+            _, _, f1_weighted, _ = precision_recall_fscore_support(gt_test, preds_test, average='weighted',zero_division=0)
+            auroc = roc_auc_score(gt_test, preds_test)
+            run_specific_results.append({'Model':model_name, 'Acc': accuracy, 'Prec':precision, 'Rec':recall, 'F1 (macro)':f1_macro, 'F1 (weighted)':f1_weighted, 'AUC':auroc})
+        results.extend(run_specific_results)
+        df_results=pd.DataFrame(run_specific_results)
+        print(df_results.to_string(index=False))
     # Create a DataFrame for the results
-    df_results = pd.DataFrame(results, columns=['Model', 'Acc', 'Prec', 'Rec', 'F1 (macro)', 'F1 (weighted)', 'AUC'])
+    df_results = pd.DataFrame(results)
     df_results.to_csv('uspark_test_set_scores.csv', index=False)
-    print(df_results)
-    
+    df_results = df_results.groupby('Model').agg(calculate_mean_and_ci).reset_index()
+    df_results['Model'] = pd.Categorical(df_results['Model'], categories=models_name, ordered=True)
+    df_results = df_results.sort_values('Model').reset_index(drop=True)
+    print(df_results.to_string(index=False))
     # End timing and print total execution time
     script_end_time = time.time()
     total_duration = script_end_time - script_start_time
@@ -321,3 +213,8 @@ if __name__ == "__main__":
     print(f"[INFO] Total execution time: {total_duration:.2f} seconds ({total_duration/60:.2f} minutes)")
     print(f"[INFO] Average time per model: {total_duration/len(models):.2f} seconds")
     print(f"{'='*60}")
+    return df_results
+
+if __name__=="__main__":
+    evaluate_model([ 'JS','JS_AC','JS_PU','JS_AC_PU', 'AS_AC_PU', 'BS_AC_PU', 'VS_AC_PU', 'PULSAR'])
+    # modified by bab
